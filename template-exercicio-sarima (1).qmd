@@ -1,0 +1,162 @@
+---
+title: "Exercício: SARIMA no comércio varejista brasileiro"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+jupyter: python3
+---
+
+## Sobre o exercício
+
+A base é a **PMC** (Pesquisa Mensal do Comércio) do IBGE: índice de volume de vendas no **comércio varejista ampliado** (inclui veículos e materiais de construção), por **Unidade da Federação**, mensal de jan/2004 em diante. Base 2022 = 100, **sem ajuste sazonal**.
+
+## Setup
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.stats as st
+from IPython.display import Markdown
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.tsa.seasonal import STL
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA, ARIMA
+from statsforecast.arima import ndiffs, nsdiffs, arima_string
+import warnings; warnings.filterwarnings("ignore")
+```
+
+## Carregando a base PMC
+
+A base já foi pré-processada, no formato "long": coluna de data `data`, índice de volume `volume_idx` e UF em `uf`.
+
+```{python}
+pmc = pd.read_csv("https://github.com/padsInsper/202634-fa/releases/download/data/pmc_volume_uf.csv")
+print(sorted(pmc["uf"].unique()))
+```
+
+## Escolha sua UF
+
+```{python}
+MINHA_UF = "São Paulo"
+if MINHA_UF not in set(pmc["uf"]):          # caso a base use sigla
+    MINHA_UF = "SP"
+assert MINHA_UF in set(pmc["uf"]), sorted(pmc["uf"].unique())
+
+df_sf = (
+    pmc.query("uf == @MINHA_UF")
+    .rename(columns={"uf": "unique_id", "data": "ds", "volume_idx": "y"})
+    [["unique_id", "ds", "y"]]
+    .reset_index(drop=True)
+)
+df_sf["ds"] = pd.to_datetime(df_sf["ds"])
+df_sf = df_sf.sort_values("ds").dropna()
+serie = df_sf.set_index("ds")["y"].asfreq("MS")
+y = serie.values.astype(float)
+df_sf.head()
+```
+
+## Análise descritiva
+
+```{python}
+fig, ax = plt.subplots(figsize=(10, 4))
+serie.plot(ax=ax); ax.set_title(f"PMC varejo ampliado – volume (2022=100) – {MINHA_UF}")
+plt.show()
+
+STL(serie, period=12).fit().plot(); plt.show()
+
+fig, axs = plt.subplots(3, 2, figsize=(12, 9))
+for i, (nome, s) in enumerate([("nível", serie),
+                               ("Δ1", serie.diff().dropna()),
+                               ("Δ1 Δ12", serie.diff().diff(12).dropna())]):
+    plot_acf(s, lags=36, ax=axs[i, 0], title=f"ACF – {nome}")
+    plot_pacf(s, lags=36, ax=axs[i, 1], title=f"PACF – {nome}", method="ywm")
+plt.tight_layout(); plt.show()
+```
+
+### Testes de raiz unitária e `ndiffs`
+
+```{python}
+def testes(s, nome):
+    a = adfuller(s, autolag="AIC"); k = kpss(s, regression="c", nlags="auto")
+    return {"série": nome, "ADF stat": a[0], "ADF p": a[1], "KPSS stat": k[0], "KPSS p": k[1]}
+
+tab_testes = pd.DataFrame([testes(serie, "nível"),
+                           testes(serie.diff().dropna(), "Δ1"),
+                           testes(serie.diff().diff(12).dropna(), "Δ1 Δ12")]).round(4)
+n_d, n_D = ndiffs(y), nsdiffs(y, period=12)
+print(f"ndiffs = {n_d} | nsdiffs = {n_D}")
+tab_testes
+```
+
+ADF: H0 = raiz unitária. KPSS: H0 = estacionariedade.
+
+## Modelagem
+
+```{python}
+modelo = AutoARIMA(season_length=12).fit(y)
+p, q, P, Q, s, d, D = modelo.model_["arma"]
+print(arima_string(modelo.model_))
+print("AICc:", round(modelo.model_["aicc"], 2))
+```
+
+### Diagnóstico dos resíduos
+
+```{python}
+res = pd.Series(np.asarray(modelo.model_["residuals"]), index=serie.index).iloc[13:]
+fig, axs = plt.subplots(2, 2, figsize=(12, 7))
+res.plot(ax=axs[0, 0], title="Resíduos")
+plot_acf(res, lags=36, ax=axs[0, 1], title="ACF dos resíduos")
+axs[1, 0].hist(res, bins=30); axs[1, 0].set_title("Histograma")
+st.probplot(res, plot=axs[1, 1]); plt.tight_layout(); plt.show()
+
+lb = acorr_ljungbox(res, lags=[12, 24], return_df=True)
+jb_p = st.jarque_bera(res).pvalue
+print(lb); print("Jarque-Bera p =", round(jb_p, 4))
+```
+
+## Previsão · 24 meses à frente
+
+```{python}
+fc = modelo.predict(h=24, level=[80, 95])
+idx = pd.date_range(serie.index[-1] + pd.offsets.MonthBegin(), periods=24, freq="MS")
+prev = pd.DataFrame(fc, index=idx)
+
+fig, ax = plt.subplots(figsize=(11, 4.5))
+serie["2015":].plot(ax=ax, label="Observado")
+ax.plot(prev.index, prev["mean"], label="Previsão")
+ax.fill_between(prev.index, prev["lo-95"], prev["hi-95"], alpha=.2, label="IC 95%")
+ax.fill_between(prev.index, prev["lo-80"], prev["hi-80"], alpha=.35, label="IC 80%")
+ax.legend(); ax.set_title(f"SARIMA – previsão 24 meses – {MINHA_UF}"); plt.show()
+prev.round(2)
+```
+
+## Discussão
+
+Perguntas: (1) ACF/PACF sugeriu sazonalidade e tendência? (2) Quantas diferenças e quais componentes AR/MA? (3) Resíduos são white noise? (4) A previsão é razoável? (5) Que outras UFs dariam um SARIMA diferente?
+
+```{python}
+#| output: asis
+acf12 = pd.Series(serie.diff().dropna()).autocorr(12)
+lb_p12, lb_p24 = lb["lb_pvalue"].iloc[0], lb["lb_pvalue"].iloc[1]
+larg_ini = prev["hi-95"].iloc[0] - prev["lo-95"].iloc[0]
+larg_fim = prev["hi-95"].iloc[-1] - prev["lo-95"].iloc[-1]
+adf_p, kpss_p = tab_testes.loc[0, "ADF p"], tab_testes.loc[0, "KPSS p"]
+
+txt = f"""
+**1. Sazonalidade e tendência.** A ACF da série em nível decai lentamente, o que indica tendência/persistência. Há picos recorrentes nas defasagens 12, 24 e 36, sinal de sazonalidade anual (autocorrelação lag 12 da série diferenciada = {acf12:.2f}). Isso é coerente com o gráfico de linha, que mostra picos todo dezembro e um nível que varia ao longo dos ciclos (queda em 2015‑16, choque em 2020). Em nível, ADF p = {adf_p:.3f} e KPSS p = {kpss_p:.3f}.
+
+**2. Ordem do modelo.** O AutoARIMA escolheu **SARIMA({p},{d},{q})({P},{D},{Q})[{s}]**, com {d} diferença(s) regular(es) e {D} sazonal(is) (`ndiffs` = {n_d}, `nsdiffs` = {n_D}). Os termos AR={p}, MA={q}, SAR={P}, SMA={Q} são compatíveis com a ACF/PACF da série Δ1Δ12: cortes nas primeiras defasagens indicam a parte regular, e o comportamento no lag 12 indica a parte sazonal.
+
+**3. Resíduos.** Ljung‑Box p = {lb_p12:.3f} (lag 12) e {lb_p24:.3f} (lag 24): {"não rejeitamos ruído branco" if min(lb_p12, lb_p24) > 0.05 else "há autocorrelação remanescente, possivelmente sazonal"}. Jarque‑Bera p = {jb_p:.3f}: {"resíduos aproximadamente normais" if jb_p > 0.05 else "caudas pesadas, puxadas sobretudo pelos outliers de 2020"}.
+
+**4. Previsão.** A projeção reproduz o padrão sazonal e fica ancorada no nível recente. A amplitude do IC 95% vai de {larg_ini:.1f} para {larg_fim:.1f} pontos ao longo dos 24 meses, alargamento esperado pela integração (d/D) do modelo.
+
+**5. Outras UFs.** São Paulo tem um varejo grande e diversificado (indústria, serviços, renda alta e distribuída), o que gera uma série relativamente suave, com sazonalidade de dezembro bem definida. Estados do Centro‑Oeste ligados ao agro (MT, MS, GO) devem apresentar tendência de crescimento mais forte e ciclos atrelados à safra e aos preços de commodities, com peso maior de veículos e materiais de construção no varejo ampliado. Estados do Nordeste com turismo relevante (CE, RN, BA) tendem a ter picos adicionais nas férias de julho e no verão. Já UFs pequenas do Norte (RR, AP, AC) têm séries bem mais voláteis, o que leva a ordens AR/MA diferentes e intervalos de previsão mais largos.
+"""
+print(txt)
+```
